@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-command -v nc >/dev/null 2>&1 || {
-  echo "nc command not found; install netcat to run this test" >&2
-  exit 1
-}
-
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 
@@ -21,7 +16,6 @@ POOL_LOG="${TMPDIR}/pool.log"
 
 cleanup() {
   local exit_code=$?
-  [[ -n "${CLIENT_PID:-}" ]] && kill "${CLIENT_PID}" 2>/dev/null || true
   [[ -n "${TARGET_PID:-}" ]] && kill "${TARGET_PID}" 2>/dev/null || true
   [[ -n "${HUB_PID:-}" ]] && kill "${HUB_PID}" 2>/dev/null || true
   [[ -n "${POOL_PID:-}" ]] && kill "${POOL_PID}" 2>/dev/null || true
@@ -31,28 +25,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start_nc_listener() {
-  local port=$1
-  local outfile=$2
-  nc -l 127.0.0.1 "${port}" >"${outfile}" &
-  local pid=$!
-  sleep 0.2
-  if kill -0 "${pid}" 2>/dev/null; then
-    echo "${pid}"
-    return
-  fi
-  nc -l -p "${port}" 127.0.0.1 >"${outfile}" &
-  pid=$!
-  sleep 0.2
-  if kill -0 "${pid}" 2>/dev/null; then
-    echo "${pid}"
-    return
-  fi
-  echo "Failed to start nc listener on port ${port}" >&2
-  exit 1
-}
-
-TARGET_PID=$(start_nc_listener "${TARGET_PORT}" "${TARGET_OUTPUT}")
+perl -MIO::Socket::INET -e '
+  use strict;
+  use warnings;
+  my ($port, $outfile) = @ARGV;
+  open my $fh, ">", $outfile or die "open $outfile: $!";
+  my $server = IO::Socket::INET->new(
+    LocalAddr => "127.0.0.1",
+    LocalPort => $port,
+    Listen    => 1,
+    Proto     => "tcp",
+    Reuse     => 1,
+  ) or die "listen $port: $!";
+  my $client = $server->accept() or die "accept failed: $!";
+  $client->autoflush(1);
+  while (1) {
+    my $buf = "";
+    my $bytes = sysread($client, $buf, 16 * 1024);
+    last unless defined $bytes && $bytes > 0;
+    print {$fh} $buf;
+  }
+' "${TARGET_PORT}" "${TARGET_OUTPUT}" &
+TARGET_PID=$!
 
 perl "${REPO_ROOT}/hub.pl" \
   --client-bind 127.0.0.1 \
@@ -73,7 +67,17 @@ POOL_PID=$!
 
 sleep 1
 
-printf "%s" "${MESSAGE}" | nc 127.0.0.1 "${CLIENT_PORT}"
+perl -MIO::Socket::INET -e '
+  my ($host, $port, $payload) = @ARGV;
+  my $sock = IO::Socket::INET->new(
+    PeerAddr => $host,
+    PeerPort => $port,
+    Proto    => "tcp",
+  ) or die "client connect failed: $!";
+  $sock->autoflush(1);
+  print $sock $payload;
+  select undef, undef, undef, 1.0;
+' 127.0.0.1 "${CLIENT_PORT}" "${MESSAGE}"
 
 sleep 1
 
@@ -85,5 +89,7 @@ else
   cat "${HUB_LOG}" || true
   echo "--- pool log ---"
   cat "${POOL_LOG}" || true
+  echo "--- target output ---"
+  cat "${TARGET_OUTPUT}" || true
   exit 1
 fi
