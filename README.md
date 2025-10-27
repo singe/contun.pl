@@ -13,7 +13,7 @@ flowchart LR
     BP[pool.pl workers\nconnecting to hub]
   end
   subgraph Target Network
-    T[target service\n(target:6666)]
+    T[target service\nport 6666]
   end
 
   Client[Client App] -- tcp connect --> JH
