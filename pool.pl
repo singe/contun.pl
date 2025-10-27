@@ -13,6 +13,8 @@ use constant MAX_BUFFER => 1024 * 1024;
 
 $SIG{PIPE} = 'IGNORE';
 
+Getopt::Long::Configure('no_ignore_case');
+
 my %opts = (
     'hub-host'     => '127.0.0.1',
     'hub-port'     => undef,

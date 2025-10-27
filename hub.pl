@@ -11,6 +11,8 @@ use constant MAX_BUFFER => 1024 * 1024; # 1 MiB per-direction safety limit
 
 $SIG{PIPE} = 'IGNORE';
 
+Getopt::Long::Configure('no_ignore_case');
+
 my %opts = (
     'client-bind' => '127.0.0.1',
     'client-port' => undef,
