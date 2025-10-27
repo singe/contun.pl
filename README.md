@@ -2,18 +2,18 @@
 
 contun is a set of Perl scripts to help establish a network tunnel from one host to another in situations when the host with the target service cannot bind any ports externaly and must connect out. There are typically two to three hosts involved the final target that the isolated host can access, the isolated or bastion host, and the jump box host. The end result should be that there's a port exposed on the jump box host that when connected to is proxied to the target host and port via the isolated bastion host.
 
-jump_client_app -> jump:4444 <- jump_hub.pl -> jump:5555 <- bastion_pool.pl -> target:6666
+jump_client_app -> jump:4444 <- jump_hub.pl -> jump:5555 <--- bastion_pool.pl ---> target:6666
 
 ```mermaid
 flowchart LR
   subgraph Jump Box
-    JH[hub.pl<br/>--client-port 4444<br/>--pool-port 5555]
+    JH[hub.pl\n--client-port 4444\n--pool-port 5555]
   end
   subgraph Bastion
-    BP[pool.pl worker(s)<br/>connecting to hub]
+    BP[pool.pl workers\nconnecting to hub]
   end
   subgraph Target Network
-    T[target service<br/>target:6666]
+    T[target service\n(target:6666)]
   end
 
   Client[Client App] -- tcp connect --> JH
