@@ -7,13 +7,13 @@ jump_client_app -> jump:4444 <- jump_hub.pl -> jump:5555 <--- bastion_pool.pl --
 ```mermaid
 flowchart LR
   subgraph Jump Box
-    JH[hub.pl\n--client-port 4444\n--pool-port 5555]
+    JH[hub.pl --client-port 4444 --pool-port 5555]
   end
   subgraph Bastion
-    BP[pool.pl workers\nconnecting to hub]
+    BP[pool.pl workers connecting to hub]
   end
   subgraph Target Network
-    T[target service\nport 6666]
+    T[target service port 6666]
   end
 
   Client[Client App] -- tcp connect --> JH
