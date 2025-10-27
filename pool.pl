@@ -6,7 +6,6 @@ use IO::Select;
 use Getopt::Long qw(GetOptions);
 use POSIX qw(:sys_wait_h);
 use Errno qw(EWOULDBLOCK EAGAIN EINTR);
-use Time::HiRes qw(sleep);
 use IO::Handle;
 
 use constant MAX_BUFFER => 1024 * 1024;
@@ -66,7 +65,7 @@ while (!$terminate) {
         delete $children{$pid};
         next;
     }
-    sleep 0.5;
+    sleep 1;
 }
 
 shutdown_workers();
