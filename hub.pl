@@ -18,12 +18,19 @@ my %opts = (
     'pool-port'   => undef,
 );
 
+my $help;
 GetOptions(
-    'client-bind=s' => \$opts{'client-bind'},
-    'client-port=i' => \$opts{'client-port'},
-    'pool-bind=s'   => \$opts{'pool-bind'},
-    'pool-port=i'   => \$opts{'pool-port'},
+    'client-bind|C=s' => \$opts{'client-bind'},
+    'client-port|c=i' => \$opts{'client-port'},
+    'pool-bind|P=s'   => \$opts{'pool-bind'},
+    'pool-port|p=i'   => \$opts{'pool-port'},
+    'help|h'          => \$help,
 ) or die usage();
+
+if ($help) {
+    print usage();
+    exit 0;
+}
 
 defined $opts{'client-port'} && defined $opts{'pool-port'}
     or die usage("Both --client-port and --pool-port are required.\n");
@@ -65,9 +72,26 @@ while (1) {
 sub usage {
     my ($msg) = @_;
     my $usage = <<"END";
-Usage: $0 --client-port <port> --pool-port <port> [--client-bind <addr>] [--pool-bind <addr>]
+Usage: $0 [options]
+
+Required:
+  -c, --client-port <port>   Local jump-box port exposed to downstream clients.
+  -p, --pool-port <port>     Listener port that accepts pool workers from the bastion.
+
+Optional:
+  -C, --client-bind <addr>   Address to bind for the downstream client listener (default 127.0.0.1).
+  -P, --pool-bind <addr>     Address to bind for incoming pool workers (default 0.0.0.0).
+  -h, --help                 Show this help and exit.
+
+hub.pl exposes two sockets: one facing clients on the jump box, and one facing
+pool workers from the bastion. Once a client connects on --client-port the hub
+will pair it with the next available worker connection arriving on --pool-port
+and forward bytes in both directions until either side closes.
+
+Example:
+  $0 -c 4444 -p 5555 -C 127.0.0.1 -P 0.0.0.0
 END
-    $usage = $msg . $usage if defined $msg;
+    $usage = $msg . "\n$usage" if defined $msg && length $msg;
     return $usage;
 }
 

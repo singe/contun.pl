@@ -22,14 +22,21 @@ my %opts = (
     'retry-delay'  => 1,
 );
 
+my $help;
 GetOptions(
-    'hub-host=s'    => \$opts{'hub-host'},
-    'hub-port=i'    => \$opts{'hub-port'},
-    'target-host=s' => \$opts{'target-host'},
-    'target-port=i' => \$opts{'target-port'},
-    'workers=i'     => \$opts{'workers'},
-    'retry-delay=f' => \$opts{'retry-delay'},
+    'hub-host|j=s'    => \$opts{'hub-host'},
+    'hub-port|p=i'    => \$opts{'hub-port'},
+    'target-host|t=s' => \$opts{'target-host'},
+    'target-port|T=i' => \$opts{'target-port'},
+    'workers|w=i'     => \$opts{'workers'},
+    'retry-delay|r=f' => \$opts{'retry-delay'},
+    'help|h'          => \$help,
 ) or die usage();
+
+if ($help) {
+    print usage();
+    exit 0;
+}
 
 defined $opts{'hub-port'}    or die usage("Missing required --hub-port\n");
 defined $opts{'target-host'} or die usage("Missing required --target-host\n");
@@ -66,9 +73,27 @@ exit 0;
 sub usage {
     my ($msg) = @_;
     my $usage = <<"END";
-Usage: $0 --hub-host <host> --hub-port <port> --target-host <host> --target-port <port> [--workers <n>] [--retry-delay <seconds>]
+Usage: $0 [options]
+
+Required:
+  -j, --hub-host <host>      Hub listener hostname or IP address (default 127.0.0.1).
+  -p, --hub-port <port>      Hub listener port accepting pool workers.
+  -t, --target-host <host>   Target hostname or IP the bastion can reach.
+  -T, --target-port <port>   Target port to proxy traffic to.
+
+Optional:
+  -w, --workers <n>          Number of concurrent worker processes to keep alive (default 4).
+  -r, --retry-delay <sec>    Seconds to wait before re-dialling the hub after a failure (default 1).
+  -h, --help                 Show this help message and exit.
+
+pool.pl maintains a pool of outbound connections from the bastion to the hub.
+Each worker blocks waiting for a START command, connects to the target service,
+and then streams bytes between the hub and the target until that session closes.
+
+Example:
+  $0 -j jumpbox -p 5555 -t target.internal -T 6666 -w 8
 END
-    $usage = $msg . $usage if defined $msg;
+    $usage = $msg . "\n$usage" if defined $msg && length $msg;
     return $usage;
 }
 
