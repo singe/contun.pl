@@ -86,7 +86,14 @@ perl "${REPO_ROOT}/hub.pl" \
   >"${HUB_LOG}" 2>&1 &
 HUB_PID=$!
 
-perl "${REPO_ROOT}/pool.pl" \
+# shellcheck disable=SC2206
+if [[ -n "${POOL_BIN:-}" ]]; then
+  read -r -a POOL_CMD <<<"${POOL_BIN}"
+else
+  POOL_CMD=(perl "${REPO_ROOT}/pool.pl")
+fi
+
+"${POOL_CMD[@]}" \
   --hub-host 127.0.0.1 \
   --hub-port "${POOL_PORT}" \
   --target-host 127.0.0.1 \
