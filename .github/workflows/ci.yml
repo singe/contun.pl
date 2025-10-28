@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run unit tests
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build host binary
+        run: CGO_ENABLED=0 go build -trimpath -tags netgo -ldflags "-s -w" -o poolgo ./cmd/poolgo
+
+      - name: Run smoke tests
+        run: |
+          set -euo pipefail
+          POOL_BIN="./poolgo" tests/simple_connect.sh
+          POOL_BIN="./poolgo" tests/concurrent_connect.sh
+          POOL_BIN="./poolgo" tests/socks_connect.sh
+          POOL_BIN="./poolgo" tests/socks_concurrent.sh
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build static binary
+        id: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          outfile="dist/poolgo_${GOOS}_${GOARCH}"
+          if [ "${GOOS}" = "windows" ]; then
+            outfile="${outfile}.exe"
+          fi
+          go build -trimpath -tags netgo -ldflags "-s -w" -o "${outfile}" ./cmd/poolgo
+          echo "artifact_path=${outfile}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: poolgo-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ steps.build.outputs.artifact_path }}
