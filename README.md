@@ -1,6 +1,6 @@
 # contun.pl - Concurrent Tunnel
 
-contun is a set of Perl scripts to help establish a network tunnel from one host to another in situations when the host that can access the target service cannot bind any ports externaly and must connect out (like a reverse shell). The isolated bastion host that has access to the private network makes a connection to a jump box the attacker can access. The jump box will have a port available that can be forwarded to the private network. `contun` supports either one to one port forwwards in direct mode or can act as a reverse SOCKS5 proxy in socks mode.
+contun is a set of Perl scripts (or go binaries too) to help establish a network tunnel from one host to another in situations when the host that can access the target service cannot bind any ports externaly and must connect out (like a reverse shell). The isolated bastion host that has access to the private network makes a connection to a jump box the attacker can access. The jump box will have a port available that can be forwarded to the private network. `contun` supports either one to one port forwwards in direct mode or can act as a reverse SOCKS5 proxy in socks mode.
 
 Here's a simple diagram (with multiple dashes indicating cross-host comms)
 
@@ -82,6 +82,25 @@ To solve this contun's pool sets up a pool of workers on the isolated bastion ho
    * `-r, --retry-delay` tweaks how long a worker waits before redialling after a failure.
 
 Once both sides run, `hub.pl` waits for clients to connect on the `--client-port`. For every incoming connection it pairs the client with the next idle worker. The worker then dials the target and streams bytes both ways. When either side closes the connection the worker returns to the idle pool, ready for the next client. Because the hub retains a pool of pre-established worker sockets, multi-connection clients (for example modern browsers, HTTP/2 reverse proxies, or tools that pipeline requests) behave as if they connected directly to the target service.
+
+### Pool implementations
+
+You can choose between two pool implementations that speak the same wire protocol to `hub.pl`:
+
+* **`pool.pl` (Perl)** – the original script, handy on bastions where only Perl is available and nothing can be compiled.
+* **`poolgo` (Go)** – a drop-in replacement that uses native goroutines instead of forking. We added it so you can cross-compile static binaries easily (`CGO_ENABLED=0`) and deploy without needing a Perl runtime. `poolgo` interoperates with the existing `hub.pl` without any hub changes.
+
+Both binaries accept the same flags and support `direct` and `socks` modes.
+
+#### Prebuilt Go binaries
+
+If you don’t want to install Go locally, grab a precompiled `poolgo` from the CI pipeline:
+
+1. Open the workflow run list at https://github.com/singe/contun.pl/actions/workflows/ci.yml.
+2. Pick a green (successful) run that matches the commit you care about.
+3. Scroll to the bottom of the run summary and expand the **Artifacts** section.
+4. Download the archive that matches your platform (e.g. `poolgo-linux-amd64`, `poolgo-darwin-arm64`, `poolgo-windows-amd64.exe`).
+5. Extract it and run with the same flags you would pass to `pool.pl`.
 
 ### Modes
 
