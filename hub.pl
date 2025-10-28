@@ -7,7 +7,6 @@ use Getopt::Long qw(GetOptions);
 use Errno qw(EWOULDBLOCK EAGAIN EINTR);
 use IO::Handle;
 use Socket qw(AF_INET AF_INET6 inet_ntop inet_pton);
-use MIME::Base64 qw(encode_base64 decode_base64);
 
 use constant MAX_BUFFER => 1024 * 1024; # 1 MiB per-direction safety limit
 
@@ -304,13 +303,13 @@ sub process_worker_hello {
             close_socket($sock, "direct mode requires DEST parameters");
             return;
         }
-        my ($atype, $addr_blob, $port_str) = @parts[4..6];
+        my ($atype, $addr_text, $port_str) = @parts[4..6];
         my $port = $port_str =~ /^\d+$/ ? $port_str + 0 : -1;
         if ($port < 1 || $port > 65535) {
             close_socket($sock, "invalid direct destination port '$port_str'");
             return;
         }
-        my ($host, undef, $err) = decode_address_blob($atype, $addr_blob);
+        my ($host, $err) = validate_address_text($atype, $addr_text);
         if (!defined $host) {
             close_socket($sock, "invalid direct destination address: $err");
             return;
@@ -319,7 +318,6 @@ sub process_worker_hello {
             atype => $atype,
             host  => $host,
             port  => $port,
-            blob  => $addr_blob,
         };
     } elsif (@parts > 3) {
         close_socket($sock, "unexpected tokens in socks mode hello");
@@ -370,16 +368,15 @@ sub process_worker_reply {
         return;
     }
     my $status_token = $parts[1];
-    my ($atype, $addr_blob, $port_str) = @parts[2,3,4];
+    my ($atype, $addr_text, $port_str) = @parts[2,3,4];
     $atype     ||= 'ipv4';
-    $addr_blob ||= encode_base64(pack('N', 0), '');
+    $addr_text ||= '0.0.0.0';
     $port_str  ||= '0';
     my $port    = $port_str =~ /^\d+$/ ? $port_str + 0 : 0;
 
-    my ($bind_host, $bind_raw, $err) = decode_address_blob($atype, $addr_blob);
+    my ($bind_host, $err) = validate_address_text($atype, $addr_text);
     if (!defined $bind_host) {
         $bind_host = '0.0.0.0';
-        $bind_raw  = "\0\0\0\0";
         $atype     = 'ipv4';
         $port      = 0;
     }
@@ -396,13 +393,13 @@ sub process_worker_reply {
         my $reply = {
             status   => 0,
             atype    => $atype,
-            raw_addr => $bind_raw,
+            host     => $bind_host,
             port     => $port,
         };
         $entry->{buffer} = '';
         start_stream($sock, $reply);
     } else {
-        handle_worker_failure($sock, $status_num, $atype, $bind_raw, $port);
+        handle_worker_failure($sock, $status_num, $atype, $bind_host, $port);
     }
 }
 
@@ -508,17 +505,10 @@ sub process_socks_state {
             $offset += 2;
             substr($entry->{buffer}, 0, $offset, '');
 
-            my ($blob, undef, $err) = encode_address_blob($atype, $addr);
-            if (!defined $blob) {
-                send_raw_socks_failure($sock, 1, "invalid address: $err");
-                return;
-            }
-
             $entry->{requested_dest} = {
                 atype => $atype,
                 host  => $addr,
                 port  => $port,
-                blob  => $blob,
             };
             $entry->{state} = 'await_worker';
             $entry->{socks_stage} = 'await_reply';
@@ -729,21 +719,20 @@ sub build_request_command {
     my $dest;
     if ($mode eq 'direct') {
         $dest = $worker_entry->{dest};
-        return unless $dest && $dest->{blob} && $dest->{port};
+        return unless $dest && $dest->{host} && $dest->{port};
         $client_entry->{requested_dest} = {
             atype => $dest->{atype},
             host  => $dest->{host},
             port  => $dest->{port},
-            blob  => $dest->{blob},
         };
     } else {
         $dest = $client_entry->{requested_dest};
-        return unless $dest && $dest->{blob} && $dest->{port};
+        return unless $dest && $dest->{host} && $dest->{port};
     }
     my $atype = $dest->{atype};
-    my $blob  = $dest->{blob};
+    my $host  = $dest->{host};
     my $port  = $dest->{port};
-    return sprintf 'REQUEST CONNECT %s %s %d', $atype, $blob, $port;
+    return sprintf 'REQUEST CONNECT %s %s %d', $atype, $host, $port;
 }
 
 sub format_dest {
@@ -805,22 +794,9 @@ sub send_socks_reply {
     my ($client, $status, $details) = @_;
     my $scode = normalize_socks_status($status);
     my $atype = $details && $details->{atype} ? $details->{atype} : 'ipv4';
-    my $raw   = $details && $details->{raw_addr} ? $details->{raw_addr} : '';
+    my $host  = $details && $details->{host}  ? $details->{host}  : '0.0.0.0';
     my $port  = $details && defined $details->{port} ? $details->{port} : 0;
-    my $atype_byte = socks_byte_from_atype($atype);
-    my $addr_bytes;
-    if ($atype eq 'ipv4') {
-        $addr_bytes = (defined $raw && length $raw == 4) ? $raw : "\0\0\0\0";
-    } elsif ($atype eq 'ipv6') {
-        $addr_bytes = (defined $raw && length $raw == 16) ? $raw : ("\0" x 16);
-    } elsif ($atype eq 'domain') {
-        my $domain = defined $raw ? $raw : '';
-        $domain = '' if length($domain) > 255;
-        $addr_bytes = chr(length($domain)) . $domain;
-    } else {
-        $atype_byte = 1;
-        $addr_bytes = "\0\0\0\0";
-    }
+    my ($atype_byte, $addr_bytes) = socks_bytes_from_host($atype, $host);
     my $payload = pack('C C C C', 5, $scode, 0, $atype_byte) . $addr_bytes . pack('n', $port);
     send_control($client, $payload);
 }
@@ -851,42 +827,42 @@ sub socks_byte_from_atype {
     return 1;
 }
 
-sub encode_address_blob {
-    my ($atype, $addr) = @_;
+sub socks_bytes_from_host {
+    my ($atype, $host) = @_;
     if ($atype eq 'ipv4') {
-        my $raw = inet_pton(AF_INET, $addr);
-        return (undef, undef, "invalid IPv4 address '$addr'") unless $raw && length $raw == 4;
-        return (encode_base64($raw, ''), $raw, undef);
+        my $raw = inet_pton(AF_INET, $host);
+        return (1, "\0\0\0\0") unless $raw && length $raw == 4;
+        return (1, $raw);
     }
     if ($atype eq 'ipv6') {
-        my $raw = inet_pton(AF_INET6, $addr);
-        return (undef, undef, "invalid IPv6 address '$addr'") unless $raw && length $raw == 16;
-        return (encode_base64($raw, ''), $raw, undef);
+        my $raw = inet_pton(AF_INET6, $host);
+        return (4, "\0" x 16) unless $raw && length $raw == 16;
+        return (4, $raw);
     }
     if ($atype eq 'domain') {
-        return (undef, undef, 'domain name too long') if length($addr) > 255;
-        return (encode_base64($addr, ''), $addr, undef);
+        my $len = length $host;
+        $len = 255 if $len > 255;
+        return (3, chr($len) . substr($host, 0, $len));
     }
-    return (undef, undef, "unknown address type '$atype'");
+    return (1, "\0\0\0\0");
 }
 
-sub decode_address_blob {
-    my ($atype, $blob) = @_;
-    my $raw;
-    eval { $raw = decode_base64($blob); 1 } or return (undef, undef, 'invalid base64');
+sub validate_address_text {
+    my ($atype, $text) = @_;
     if ($atype eq 'ipv4') {
-        return (undef, undef, 'invalid IPv4 length') unless defined $raw && length $raw == 4;
-        my $addr = inet_ntop(AF_INET, $raw);
-        return ($addr, $raw, undef);
+        my $raw = inet_pton(AF_INET, $text);
+        return ($text, undef) if $raw && length $raw == 4;
+        return (undef, "invalid IPv4 address '$text'");
     }
     if ($atype eq 'ipv6') {
-        return (undef, undef, 'invalid IPv6 length') unless defined $raw && length $raw == 16;
-        my $addr = inet_ntop(AF_INET6, $raw);
-        return ($addr, $raw, undef);
+        my $raw = inet_pton(AF_INET6, $text);
+        return ($text, undef) if $raw && length $raw == 16;
+        return (undef, "invalid IPv6 address '$text'");
     }
     if ($atype eq 'domain') {
-        return (undef, undef, 'domain too long') if length($raw) > 255;
-        return ($raw, $raw, undef);
+        return (undef, 'domain empty') unless length $text;
+        return (undef, 'domain too long') if length($text) > 255;
+        return ($text, undef);
     }
-    return (undef, undef, "unknown address type '$atype'");
+    return (undef, "unknown address type '$atype'");
 }

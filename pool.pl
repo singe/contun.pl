@@ -8,10 +8,8 @@ use POSIX qw(:sys_wait_h);
 use Errno qw(EWOULDBLOCK EAGAIN EINTR);
 use IO::Handle;
 use Socket qw(AF_INET AF_INET6 inet_ntop inet_pton);
-use MIME::Base64 qw(encode_base64 decode_base64);
 
 use constant MAX_BUFFER      => 1024 * 1024;
-use constant ZERO_IPV4_BLOB  => encode_base64(pack('N', 0), '');
 
 $SIG{PIPE} = 'IGNORE';
 
@@ -206,23 +204,23 @@ sub handle_hub_session {
         $line =~ s/\r?\n$//;
         next if $line eq '';
         if ($line =~ /^REQUEST\s+CONNECT\s+(\S+)\s+(\S+)\s+(\d+)$/) {
-            my ($atype, $addr_blob, $port_str) = ($1, $2, $3);
+            my ($atype, $addr_text, $port_str) = ($1, $2, $3);
             my $port = $port_str + 0;
             if ($port < 1 || $port > 65535) {
                 info("Worker $$ received invalid port '$port_str'");
-                send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                send_reply($hub, 1, 'ipv4', '0.0.0.0', 0);
                 next;
             }
-            my ($host, undef, $err) = decode_address_blob($atype, $addr_blob);
+            my ($host, $err) = validate_address_text($atype, $addr_text);
             unless (defined $host) {
                 info("Worker $$ failed to decode destination: $err");
-                send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                send_reply($hub, 1, 'ipv4', '0.0.0.0', 0);
                 next;
             }
             if ($opts{'mode'} eq 'direct') {
                 if (!$direct_dest || $host ne $direct_dest->{host} || $port != $direct_dest->{port}) {
                     info("Worker $$ rejecting mismatched request $host:$port (expected $direct_dest->{host}:$direct_dest->{port})");
-                    send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                    send_reply($hub, 1, 'ipv4', '0.0.0.0', 0);
                     next;
                 }
             }
@@ -230,11 +228,11 @@ sub handle_hub_session {
             unless ($target) {
                 my $status = map_error_to_status($connect_err);
                 info("Worker $$ failed to connect to $host:$port: $connect_err");
-                send_reply($hub, $status, 'ipv4', ZERO_IPV4_BLOB, 0);
+                send_reply($hub, $status, 'ipv4', '0.0.0.0', 0);
                 next;
             }
             info("Worker $$ bridged to $host:$port");
-            send_reply($hub, 0, 'ipv4', ZERO_IPV4_BLOB, 0);
+            send_reply($hub, 0, 'ipv4', '0.0.0.0', 0);
             bridge_streams($hub, $target, $exit_flag_ref);
             eval { $target->close };
             $hub->blocking(1);
@@ -328,7 +326,7 @@ sub perform_handshake {
     my $hello = "HELLO 1 $mode";
     if ($mode eq 'direct') {
         my $dest = $direct_dest or die "direct destination not prepared";
-        $hello .= sprintf ' DEST %s %s %d', $dest->{atype}, $dest->{blob}, $dest->{port};
+        $hello .= sprintf ' DEST %s %s %d', $dest->{atype}, $dest->{host}, $dest->{port};
     }
     print $hub "$hello\n" or die "Failed to send handshake to hub: $!";
     my $resp = <$hub>;
@@ -340,21 +338,18 @@ sub perform_handshake {
 }
 
 sub send_reply {
-    my ($hub, $status, $atype, $addr_blob, $port) = @_;
-    printf {$hub} "REPLY %d %s %s %d\n", $status, $atype, $addr_blob, $port
+    my ($hub, $status, $atype, $addr_text, $port) = @_;
+    printf {$hub} "REPLY %d %s %s %d\n", $status, $atype, $addr_text, $port
         or die "Failed to send reply to hub: $!";
 }
 
 sub prepare_direct_destination {
     my ($host, $port) = @_;
     my $atype = classify_host_type($host);
-    my ($blob, undef, $err) = encode_address_blob($atype, $host);
-    die "Failed to encode direct destination: $err" unless defined $blob;
     return {
         host  => $host,
         port  => $port + 0,
         atype => $atype,
-        blob  => $blob,
     };
 }
 
@@ -363,46 +358,6 @@ sub classify_host_type {
     return 'ipv4' if inet_pton(AF_INET, $host);
     return 'ipv6' if inet_pton(AF_INET6, $host);
     return 'domain';
-}
-
-sub encode_address_blob {
-    my ($atype, $addr) = @_;
-    if ($atype eq 'ipv4') {
-        my $raw = inet_pton(AF_INET, $addr);
-        return (undef, undef, "invalid IPv4 address '$addr'") unless $raw && length $raw == 4;
-        return (encode_base64($raw, ''), $raw, undef);
-    }
-    if ($atype eq 'ipv6') {
-        my $raw = inet_pton(AF_INET6, $addr);
-        return (undef, undef, "invalid IPv6 address '$addr'") unless $raw && length $raw == 16;
-        return (encode_base64($raw, ''), $raw, undef);
-    }
-    if ($atype eq 'domain') {
-        return (undef, undef, 'domain name too long') if length($addr) > 255;
-        return (encode_base64($addr, ''), $addr, undef);
-    }
-    return (undef, undef, "unknown address type '$atype'");
-}
-
-sub decode_address_blob {
-    my ($atype, $blob) = @_;
-    my $raw;
-    eval { $raw = decode_base64($blob); 1 } or return (undef, undef, 'invalid base64');
-    if ($atype eq 'ipv4') {
-        return (undef, undef, 'invalid IPv4 length') unless defined $raw && length $raw == 4;
-        my $addr = inet_ntop(AF_INET, $raw);
-        return ($addr, $raw, undef);
-    }
-    if ($atype eq 'ipv6') {
-        return (undef, undef, 'invalid IPv6 length') unless defined $raw && length $raw == 16;
-        my $addr = inet_ntop(AF_INET6, $raw);
-        return ($addr, $raw, undef);
-    }
-    if ($atype eq 'domain') {
-        return (undef, undef, 'domain too long') if length($raw) > 255;
-        return ($raw, $raw, undef);
-    }
-    return (undef, undef, "unknown address type '$atype'");
 }
 
 sub map_error_to_status {
@@ -414,4 +369,24 @@ sub map_error_to_status {
     return 4 if $err =~ /no route/i;
     return 4 if $err =~ /timed? out/i;
     return 1;
+}
+
+sub validate_address_text {
+    my ($atype, $text) = @_;
+    if ($atype eq 'ipv4') {
+        my $raw = inet_pton(AF_INET, $text);
+        return ($text, undef) if $raw && length $raw == 4;
+        return (undef, "invalid IPv4 address '$text'");
+    }
+    if ($atype eq 'ipv6') {
+        my $raw = inet_pton(AF_INET6, $text);
+        return ($text, undef) if $raw && length $raw == 16;
+        return (undef, "invalid IPv6 address '$text'");
+    }
+    if ($atype eq 'domain') {
+        return (undef, 'domain empty') unless length $text;
+        return (undef, 'domain too long') if length($text) > 255;
+        return ($text, undef);
+    }
+    return (undef, "unknown address type '$atype'");
 }
