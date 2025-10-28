@@ -7,8 +7,11 @@ use Getopt::Long qw(GetOptions);
 use POSIX qw(:sys_wait_h);
 use Errno qw(EWOULDBLOCK EAGAIN EINTR);
 use IO::Handle;
+use Socket qw(AF_INET AF_INET6 inet_ntop inet_pton);
+use MIME::Base64 qw(encode_base64 decode_base64);
 
-use constant MAX_BUFFER => 1024 * 1024;
+use constant MAX_BUFFER      => 1024 * 1024;
+use constant ZERO_IPV4_BLOB  => encode_base64(pack('N', 0), '');
 
 $SIG{PIPE} = 'IGNORE';
 
@@ -21,6 +24,7 @@ my %opts = (
     'target-port'  => undef,
     'workers'      => 4,
     'retry-delay'  => 1,
+    'mode'         => 'direct',
 );
 
 my $help;
@@ -31,6 +35,7 @@ GetOptions(
     'target-port|T=i' => \$opts{'target-port'},
     'workers|w=i'     => \$opts{'workers'},
     'retry-delay|r=f' => \$opts{'retry-delay'},
+    'mode|m=s'        => \$opts{'mode'},
     'help|h'          => \$help,
 ) or die usage();
 
@@ -40,11 +45,28 @@ if ($help) {
 }
 
 defined $opts{'hub-port'}    or die usage("Missing required --hub-port\n");
-defined $opts{'target-host'} or die usage("Missing required --target-host\n");
-defined $opts{'target-port'} or die usage("Missing required --target-port\n");
 $opts{'workers'} > 0         or die usage("--workers must be positive\n");
 
-info("Starting pool with $opts{workers} worker(s) targeting $opts{'target-host'}:$opts{'target-port'} via $opts{'hub-host'}:$opts{'hub-port'}");
+$opts{'mode'} = lc $opts{'mode'};
+$opts{'mode'} =~ /^(direct|socks)$/
+    or die usage("--mode must be either direct or socks\n");
+
+if ($opts{'mode'} eq 'direct') {
+    defined $opts{'target-host'} or die usage("Missing required --target-host for direct mode\n");
+    defined $opts{'target-port'} or die usage("Missing required --target-port for direct mode\n");
+} else {
+    if (defined $opts{'target-host'} || defined $opts{'target-port'}) {
+        die usage("--target-host/--target-port are not used in socks mode\n");
+    }
+}
+
+my $direct_dest;
+if ($opts{'mode'} eq 'direct') {
+    $direct_dest = prepare_direct_destination($opts{'target-host'}, $opts{'target-port'});
+    info("Starting pool with $opts{workers} worker(s) in direct mode targeting $opts{'target-host'}:$opts{'target-port'} via $opts{'hub-host'}:$opts{'hub-port'}");
+} else {
+    info("Starting pool with $opts{workers} worker(s) in socks mode via $opts{'hub-host'}:$opts{'hub-port'}");
+}
 
 my %children;
 my $terminate = 0;
@@ -79,6 +101,9 @@ Usage: $0 [options]
 Required:
   -j, --hub-host <host>      Hub listener hostname or IP address (default 127.0.0.1).
   -p, --hub-port <port>      Hub listener port accepting pool workers.
+  -m, --mode <mode>          Operation mode: direct or socks (default direct).
+
+Direct mode:
   -t, --target-host <host>   Target hostname or IP the bastion can reach.
   -T, --target-port <port>   Target port to proxy traffic to.
 
@@ -88,11 +113,14 @@ Optional:
   -h, --help                 Show this help message and exit.
 
 pool.pl maintains a pool of outbound connections from the bastion to the hub.
-Each worker blocks waiting for a START command, connects to the target service,
-and then streams bytes between the hub and the target until that session closes.
+In direct mode each worker declares a fixed target and repeatedly proxies
+streams to that host:port. In socks mode workers wait for the hub to supply a
+destination on every session, allowing downstream SOCKS5 clients to choose their
+own targets.
 
 Example:
-  $0 -j jumpbox -p 5555 -t target.internal -T 6666 -w 8
+  $0 -j jumpbox -p 5555 -m direct -t target.internal -T 6666 -w 8
+  $0 -j jumpbox -p 5555 -m socks -w 4
 END
     $usage = $msg . "\n$usage" if defined $msg && length $msg;
     return $usage;
@@ -168,7 +196,7 @@ sub connect_to_hub {
 
 sub handle_hub_session {
     my ($hub, $exit_flag_ref) = @_;
-    print $hub "POOL 1\n" or die "Failed to send handshake to hub: $!";
+    perform_handshake($hub);
     while (!$${exit_flag_ref}) {
         my $line = <$hub>;
         unless (defined $line) {
@@ -177,18 +205,40 @@ sub handle_hub_session {
         }
         $line =~ s/\r?\n$//;
         next if $line eq '';
-        if ($line eq 'START') {
-            my ($target, $err) = connect_to_target();
-            unless ($target) {
-                $err ||= 'target connect failed';
-                $err =~ s/\s+/ /g;
-                print $hub "ERR $err\n";
-                return;
+        if ($line =~ /^REQUEST\s+CONNECT\s+(\S+)\s+(\S+)\s+(\d+)$/) {
+            my ($atype, $addr_blob, $port_str) = ($1, $2, $3);
+            my $port = $port_str + 0;
+            if ($port < 1 || $port > 65535) {
+                info("Worker $$ received invalid port '$port_str'");
+                send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                next;
             }
-            print $hub "OK\n" or die "Failed to confirm target ready: $!";
+            my ($host, undef, $err) = decode_address_blob($atype, $addr_blob);
+            unless (defined $host) {
+                info("Worker $$ failed to decode destination: $err");
+                send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                next;
+            }
+            if ($opts{'mode'} eq 'direct') {
+                if (!$direct_dest || $host ne $direct_dest->{host} || $port != $direct_dest->{port}) {
+                    info("Worker $$ rejecting mismatched request $host:$port (expected $direct_dest->{host}:$direct_dest->{port})");
+                    send_reply($hub, 1, 'ipv4', ZERO_IPV4_BLOB, 0);
+                    next;
+                }
+            }
+            my ($target, $connect_err) = connect_to_target($host, $port);
+            unless ($target) {
+                my $status = map_error_to_status($connect_err);
+                info("Worker $$ failed to connect to $host:$port: $connect_err");
+                send_reply($hub, $status, 'ipv4', ZERO_IPV4_BLOB, 0);
+                next;
+            }
+            info("Worker $$ bridged to $host:$port");
+            send_reply($hub, 0, 'ipv4', ZERO_IPV4_BLOB, 0);
             bridge_streams($hub, $target, $exit_flag_ref);
             eval { $target->close };
-            return;
+            $hub->blocking(1);
+            last if $${exit_flag_ref};
         } else {
             info("Worker $$ received unexpected control '$line'");
         }
@@ -196,20 +246,20 @@ sub handle_hub_session {
 }
 
 sub connect_to_target {
+    my ($host, $port) = @_;
     my $sock = IO::Socket::INET->new(
-        PeerAddr => $opts{'target-host'},
-        PeerPort => $opts{'target-port'},
+        PeerAddr => $host,
+        PeerPort => $port,
         Proto    => 'tcp',
         Timeout  => 5,
     );
     unless ($sock) {
         my $err = "$!";
-        info("Worker $$ failed to connect to target: $err");
         return wantarray ? (undef, $err) : undef;
     }
     $sock->autoflush(1);
     binmode($sock);
-    info("Worker $$ connected to target $opts{'target-host'}:$opts{'target-port'}");
+    info("Worker $$ connected to target $host:$port");
     return wantarray ? ($sock, undef) : $sock;
 }
 
@@ -270,4 +320,98 @@ sub bridge_streams {
 sub set_nonblocking {
     my ($sock) = @_;
     $sock->blocking(0);
+}
+
+sub perform_handshake {
+    my ($hub) = @_;
+    my $mode = $opts{'mode'};
+    my $hello = "HELLO 1 $mode";
+    if ($mode eq 'direct') {
+        my $dest = $direct_dest or die "direct destination not prepared";
+        $hello .= sprintf ' DEST %s %s %d', $dest->{atype}, $dest->{blob}, $dest->{port};
+    }
+    print $hub "$hello\n" or die "Failed to send handshake to hub: $!";
+    my $resp = <$hub>;
+    die "Hub closed during handshake" unless defined $resp;
+    $resp =~ s/\r?\n$//;
+    if ($resp ne 'OK') {
+        die "Hub rejected handshake: $resp";
+    }
+}
+
+sub send_reply {
+    my ($hub, $status, $atype, $addr_blob, $port) = @_;
+    printf {$hub} "REPLY %d %s %s %d\n", $status, $atype, $addr_blob, $port
+        or die "Failed to send reply to hub: $!";
+}
+
+sub prepare_direct_destination {
+    my ($host, $port) = @_;
+    my $atype = classify_host_type($host);
+    my ($blob, undef, $err) = encode_address_blob($atype, $host);
+    die "Failed to encode direct destination: $err" unless defined $blob;
+    return {
+        host  => $host,
+        port  => $port + 0,
+        atype => $atype,
+        blob  => $blob,
+    };
+}
+
+sub classify_host_type {
+    my ($host) = @_;
+    return 'ipv4' if inet_pton(AF_INET, $host);
+    return 'ipv6' if inet_pton(AF_INET6, $host);
+    return 'domain';
+}
+
+sub encode_address_blob {
+    my ($atype, $addr) = @_;
+    if ($atype eq 'ipv4') {
+        my $raw = inet_pton(AF_INET, $addr);
+        return (undef, undef, "invalid IPv4 address '$addr'") unless $raw && length $raw == 4;
+        return (encode_base64($raw, ''), $raw, undef);
+    }
+    if ($atype eq 'ipv6') {
+        my $raw = inet_pton(AF_INET6, $addr);
+        return (undef, undef, "invalid IPv6 address '$addr'") unless $raw && length $raw == 16;
+        return (encode_base64($raw, ''), $raw, undef);
+    }
+    if ($atype eq 'domain') {
+        return (undef, undef, 'domain name too long') if length($addr) > 255;
+        return (encode_base64($addr, ''), $addr, undef);
+    }
+    return (undef, undef, "unknown address type '$atype'");
+}
+
+sub decode_address_blob {
+    my ($atype, $blob) = @_;
+    my $raw;
+    eval { $raw = decode_base64($blob); 1 } or return (undef, undef, 'invalid base64');
+    if ($atype eq 'ipv4') {
+        return (undef, undef, 'invalid IPv4 length') unless defined $raw && length $raw == 4;
+        my $addr = inet_ntop(AF_INET, $raw);
+        return ($addr, $raw, undef);
+    }
+    if ($atype eq 'ipv6') {
+        return (undef, undef, 'invalid IPv6 length') unless defined $raw && length $raw == 16;
+        my $addr = inet_ntop(AF_INET6, $raw);
+        return ($addr, $raw, undef);
+    }
+    if ($atype eq 'domain') {
+        return (undef, undef, 'domain too long') if length($raw) > 255;
+        return ($raw, $raw, undef);
+    }
+    return (undef, undef, "unknown address type '$atype'");
+}
+
+sub map_error_to_status {
+    my ($err) = @_;
+    return 1 unless defined $err;
+    return 5 if $err =~ /refused/i;
+    return 3 if $err =~ /network.*unreachable/i;
+    return 4 if $err =~ /host.*unreachable/i;
+    return 4 if $err =~ /no route/i;
+    return 4 if $err =~ /timed? out/i;
+    return 1;
 }

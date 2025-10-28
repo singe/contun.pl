@@ -13,11 +13,12 @@ command -v curl >/dev/null 2>&1 || {
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 
-CLIENT_PORT=${CLIENT_PORT:-7100}
-POOL_PORT=${POOL_PORT:-7200}
-TARGET_PORT=${TARGET_PORT:-7300}
+CLIENT_PORT=${CLIENT_PORT:-9100}
+POOL_PORT=${POOL_PORT:-9200}
+TARGET_PORT=${TARGET_PORT:-9300}
 WORKERS=${WORKERS:-4}
 REQUESTS=${REQUESTS:-4}
+TARGET_HOSTNAME=${TARGET_HOSTNAME:-localhost}
 
 TMPDIR=$(mktemp -d)
 SERVER_LOG="${TMPDIR}/server.log"
@@ -68,16 +69,14 @@ perl "${REPO_ROOT}/hub.pl" \
   --client-port "${CLIENT_PORT}" \
   --pool-bind 127.0.0.1 \
   --pool-port "${POOL_PORT}" \
-  --mode direct \
+  --mode socks \
   >"${HUB_LOG}" 2>&1 &
 HUB_PID=$!
 
 perl "${REPO_ROOT}/pool.pl" \
   --hub-host 127.0.0.1 \
   --hub-port "${POOL_PORT}" \
-  --target-host 127.0.0.1 \
-  --target-port "${TARGET_PORT}" \
-  --mode direct \
+  --mode socks \
   --workers "${WORKERS}" \
   >"${POOL_LOG}" 2>&1 &
 POOL_PID=$!
@@ -86,12 +85,14 @@ sleep 2
 
 seq 1 "${REQUESTS}" | xargs -I{} -P "${REQUESTS}" bash -c '
   set -euo pipefail
-  curl -sS --max-time 5 "http://127.0.0.1:'"${CLIENT_PORT}"'/req{}" >"'"${TMPDIR}"'/resp{}"
+  curl -sS --max-time 5 \
+    --socks5-hostname 127.0.0.1:'"${CLIENT_PORT}"' \
+    "http://'"${TARGET_HOSTNAME}"':'"${TARGET_PORT}"'/req{}" >"'"${TMPDIR}"'/resp{}"
 '
 
 for idx in $(seq 1 "${REQUESTS}"); do
   if ! grep -q "/req${idx}" "${TMPDIR}/resp${idx}"; then
-    echo "concurrent_connect: FAILED (response ${idx} missing)" >&2
+    echo "socks_concurrent: FAILED (response ${idx} missing)" >&2
     echo "--- hub log ---"
     cat "${HUB_LOG}" || true
     echo "--- pool log ---"
@@ -101,8 +102,8 @@ for idx in $(seq 1 "${REQUESTS}"); do
 done
 
 if [[ $(wc -l < "${SERVER_LOG}") -lt ${REQUESTS} ]]; then
-  echo "concurrent_connect: FAILED (server saw fewer requests than expected)" >&2
+  echo "socks_concurrent: FAILED (server saw fewer requests than expected)" >&2
   exit 1
 fi
 
-echo "concurrent_connect: success"
+echo "socks_concurrent: success"

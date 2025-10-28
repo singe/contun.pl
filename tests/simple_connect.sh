@@ -53,6 +53,7 @@ perl "${REPO_ROOT}/hub.pl" \
   --client-port "${CLIENT_PORT}" \
   --pool-bind 127.0.0.1 \
   --pool-port "${POOL_PORT}" \
+  --mode direct \
   >"${HUB_LOG}" 2>&1 &
 HUB_PID=$!
 
@@ -61,6 +62,7 @@ perl "${REPO_ROOT}/pool.pl" \
   --hub-port "${POOL_PORT}" \
   --target-host 127.0.0.1 \
   --target-port "${TARGET_PORT}" \
+  --mode direct \
   --workers 1 \
   >"${POOL_LOG}" 2>&1 &
 POOL_PID=$!
