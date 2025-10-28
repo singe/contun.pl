@@ -19,6 +19,7 @@ TARGET_PORT=${TARGET_PORT:-8300}
 
 TMPDIR=$(mktemp -d)
 RESPONSE_PATH="${TMPDIR}/response.txt"
+EXPECTED_PATH="${TMPDIR}/expected.html"
 SERVER_LOG="${TMPDIR}/server.log"
 HUB_LOG="${TMPDIR}/hub.log"
 POOL_LOG="${TMPDIR}/pool.log"
@@ -43,11 +44,25 @@ import threading
 PORT = int(sys.argv[1])
 LOG_PATH = sys.argv[2]
 
+HTML_BODY = """\
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Test Not Found</title>
+  </head>
+  <body>
+    <h1>¡404 – recurso no encontrado!</h1>
+    <p>This is a multi-line body served at {path}.</p>
+  </body>
+</html>
+"""
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = f"hello from target {self.path}\n".encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        body = HTML_BODY.format(path=self.path).encode("utf-8")
+        self.send_response(404)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -85,7 +100,21 @@ curl --socks5-hostname 127.0.0.1:"${CLIENT_PORT}" \
   "http://localhost:${TARGET_PORT}/probe" \
   >"${RESPONSE_PATH}"
 
-if grep -q "hello from target /probe" "${RESPONSE_PATH}"; then
+cat <<'EOF' >"${EXPECTED_PATH}"
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Test Not Found</title>
+  </head>
+  <body>
+    <h1>¡404 – recurso no encontrado!</h1>
+    <p>This is a multi-line body served at /probe.</p>
+  </body>
+</html>
+EOF
+
+if diff -u "${EXPECTED_PATH}" "${RESPONSE_PATH}" >/dev/null; then
   echo "socks_connect: success"
 else
   echo "socks_connect: FAILED"

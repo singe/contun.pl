@@ -44,11 +44,25 @@ import threading
 PORT = int(sys.argv[1])
 LOG_PATH = sys.argv[2]
 
+HTML_BODY = """\
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Concurrent Test</title>
+  </head>
+  <body>
+    <p>Request served at {path}</p>
+    <p>Thread {thread}</p>
+  </body>
+</html>
+"""
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = f"hello from target {self.path}\n".encode()
+        body = HTML_BODY.format(path=self.path, thread=threading.get_ident()).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
